@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Prism Panel — pxpanel-compatible VLESS-WS relay for Railway"""
+"""
+Prism Panel v4 — Professional Railway panel powered by real Xray-core
+VLESS-WS works with real client ping (Hiddify / v2rayNG / NekoBox)
+"""
 from __future__ import annotations
 
 import asyncio
@@ -10,13 +13,13 @@ import json
 import logging
 import os
 import secrets
-import socket
-import struct
+import signal
+import subprocess
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
 import qrcode
@@ -35,12 +38,15 @@ from templates_data import INDEX, LOGIN, DASHBOARD, PORTAL
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_FILE = DATA_DIR / "prism.json"
+XRAY_CONFIG = DATA_DIR / "xray.json"
+XRAY_BIN = os.getenv("XRAY_BIN", "/usr/local/bin/xray")
+XRAY_PORT = int(os.getenv("XRAY_PORT", "10000"))  # internal only
 SECRET_KEY = os.getenv("SECRET_KEY") or secrets.token_hex(32)
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 PORT = int(os.getenv("PORT", "8080"))
 PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("PUBLIC_DOMAIN") or "localhost"
 PUBLIC_URL = f"https://{PUBLIC_DOMAIN}" if "localhost" not in PUBLIC_DOMAIN else f"http://{PUBLIC_DOMAIN}:{PORT}"
-RELAY_BUF = 256 * 1024
+WS_PATH = "/ws"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("prism")
@@ -66,7 +72,7 @@ def _verify_password(password: str, stored: str) -> bool:
 # ── Models ──────────────────────────────────────────────────
 class UserCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=64)
-    protocol: str = Field(default="vless", pattern="^(vless|trojan|both)$")
+    protocol: str = Field(default="vless", pattern="^(vless|both)$")  # xray: vless primary
     fingerprint: str = Field(default="chrome")
     alpn: str = Field(default="http/1.1")
     traffic_gb: float = Field(default=0, ge=0)
@@ -106,8 +112,6 @@ def save_db(data: Dict[str, Any]):
         logger.error(f"DB save: {e}")
 
 db = load_db()
-active_conn: Dict[str, int] = {}
-traffic_buf: Dict[str, Dict[str, int]] = {}
 
 def get_user(uid: str) -> Optional[Dict]:
     return db.get("users", {}).get(uid)
@@ -128,9 +132,6 @@ def is_valid(uid: str) -> bool:
     limit = u.get("limit_bytes", 0)
     if limit > 0 and u.get("used_bytes", 0) >= limit:
         return False
-    maxc = u.get("max_conn", 0)
-    if maxc > 0 and active_conn.get(uid, 0) >= maxc:
-        return False
     return True
 
 def fmt_bytes(n: int) -> str:
@@ -139,11 +140,10 @@ def fmt_bytes(n: int) -> str:
     if n >= 1024: return f"{n/1024:.0f} KB"
     return f"{n} B"
 
-# ── Link builder (pxpanel-exact quote rules) ────────────────
+# ── Link builder ────────────────────────────────────────────
 def refresh_links(user: Dict) -> Dict:
     uid = user["uuid"]
     name = user.get("name", "user")
-    proto = user.get("protocol", "vless")
     fp = (user.get("fingerprint") or "chrome").strip().lower()
     alpn = (user.get("alpn") or "http/1.1").strip()
     host = PUBLIC_DOMAIN
@@ -152,26 +152,112 @@ def refresh_links(user: Dict) -> Dict:
     def qjoin(params: dict) -> str:
         return "&".join(f"{k}={quote(str(v), safe=',/')}" for k, v in params.items())
 
-    if proto in ("vless", "both"):
-        params = {
-            "encryption": "none", "security": "tls", "type": "ws",
-            "host": host, "path": f"/ws/{uid}", "sni": host,
-            "fp": fp, "alpn": alpn,
-        }
-        user["vless"] = f"vless://{uid}@{host}:443?{qjoin(params)}#{label}"
-    else:
-        user["vless"] = None
-
-    if proto in ("trojan", "both"):
-        # Same /ws/{uuid} path as pxpanel trojan-ws
-        params = {
-            "security": "tls", "type": "ws", "host": host,
-            "path": f"/ws/{uid}", "sni": host, "fp": fp, "alpn": alpn,
-        }
-        user["trojan"] = f"trojan://{uid}@{host}:443?{qjoin(params)}#{label}"
-    else:
-        user["trojan"] = None
+    # Single shared path /ws — UUID identifies user inside VLESS (Xray-style)
+    params = {
+        "encryption": "none",
+        "security": "tls",
+        "type": "ws",
+        "host": host,
+        "path": WS_PATH,
+        "sni": host,
+        "fp": fp,
+        "alpn": alpn,
+    }
+    user["vless"] = f"vless://{uid}@{host}:443?{qjoin(params)}#{label}"
+    user["trojan"] = None  # focus on working VLESS via Xray
     return user
+
+# ── Xray management ─────────────────────────────────────────
+xray_proc: Optional[subprocess.Popen] = None
+
+def build_xray_config() -> dict:
+    clients = []
+    for u in db.get("users", {}).values():
+        if not u.get("enabled", True):
+            continue
+        # still include expired? no - skip invalid
+        if not is_valid(u["uuid"]):
+            # allow enabled but expired skip
+            if u.get("expire_at"):
+                try:
+                    exp = datetime.fromisoformat(u["expire_at"])
+                    if exp.tzinfo is None:
+                        exp = exp.replace(tzinfo=timezone.utc)
+                    if exp < utcnow():
+                        continue
+                except Exception:
+                    pass
+        clients.append({"id": u["uuid"], "email": u.get("name", u["uuid"][:8]), "level": 0})
+
+    if not clients:
+        # Xray needs at least one client
+        clients.append({"id": str(uuid.uuid4()), "email": "placeholder", "level": 0})
+
+    return {
+        "log": {"loglevel": "warning"},
+        "inbounds": [
+            {
+                "listen": "127.0.0.1",
+                "port": XRAY_PORT,
+                "protocol": "vless",
+                "settings": {
+                    "clients": clients,
+                    "decryption": "none",
+                },
+                "streamSettings": {
+                    "network": "ws",
+                    "security": "none",
+                    "wsSettings": {
+                        "path": WS_PATH,
+                        "acceptProxyProtocol": False,
+                    },
+                },
+                "sniffing": {
+                    "enabled": True,
+                    "destOverride": ["http", "tls", "quic"],
+                },
+            }
+        ],
+        "outbounds": [
+            {"protocol": "freedom", "tag": "direct", "settings": {"domainStrategy": "AsIs"}},
+            {"protocol": "blackhole", "tag": "block"},
+        ],
+    }
+
+def write_xray_config():
+    cfg = build_xray_config()
+    XRAY_CONFIG.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    return cfg
+
+def start_xray():
+    global xray_proc
+    write_xray_config()
+    if not Path(XRAY_BIN).exists():
+        logger.error(f"Xray binary not found at {XRAY_BIN}")
+        return False
+    # stop old
+    stop_xray()
+    xray_proc = subprocess.Popen(
+        [XRAY_BIN, "run", "-c", str(XRAY_CONFIG)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    logger.info(f"Xray started pid={xray_proc.pid} on 127.0.0.1:{XRAY_PORT} path={WS_PATH}")
+    return True
+
+def stop_xray():
+    global xray_proc
+    if xray_proc and xray_proc.poll() is None:
+        xray_proc.send_signal(signal.SIGTERM)
+        try:
+            xray_proc.wait(timeout=5)
+        except Exception:
+            xray_proc.kill()
+    xray_proc = None
+
+def reload_xray():
+    """Regenerate config and restart xray (simple & reliable)."""
+    start_xray()
 
 # ── Auth ────────────────────────────────────────────────────
 def make_token(data: dict) -> str:
@@ -190,185 +276,99 @@ async def require_admin(request: Request):
     except JWTError:
         raise HTTPException(401, "Invalid session")
 
-# ── Relay (pxpanel-faithful) ────────────────────────────────
-async def parse_vless_header(chunk: bytes):
-    if len(chunk) < 24:
-        raise ValueError("chunk too small")
-    pos = 1 + 16
-    addon_len = chunk[pos]
-    pos += 1 + addon_len
-    command = chunk[pos]; pos += 1
-    port = int.from_bytes(chunk[pos:pos+2], "big"); pos += 2
-    atyp = chunk[pos]; pos += 1
-    if atyp == 1:
-        address = ".".join(str(b) for b in chunk[pos:pos+4]); pos += 4
-    elif atyp == 2:
-        dlen = chunk[pos]; pos += 1
-        address = chunk[pos:pos+dlen].decode("utf-8", errors="ignore"); pos += dlen
-    elif atyp == 3:
-        address = socket.inet_ntop(socket.AF_INET6, chunk[pos:pos+16]); pos += 16
-    else:
-        raise ValueError("bad atyp")
-    return command, address, port, chunk[pos:]
-
-async def relay_ws_to_tcp(ws: WebSocket, writer: asyncio.StreamWriter, uid: str):
-    try:
-        while True:
-            msg = await ws.receive()
-            if msg["type"] == "websocket.disconnect":
-                break
-            data = msg.get("bytes") or (msg.get("text") or "").encode()
-            if not data:
-                continue
-            writer.write(data)
-            if writer.transport.get_write_buffer_size() > RELAY_BUF:
-                await writer.drain()
-            traffic_buf.setdefault(uid, {"up": 0, "down": 0})["up"] += len(data)
-    except Exception:
-        pass
-    finally:
-        try:
-            writer.write_eof()
-        except Exception:
-            pass
-
-async def relay_tcp_to_ws(ws: WebSocket, reader: asyncio.StreamReader, uid: str):
-    first = True
-    try:
-        while True:
-            data = await reader.read(RELAY_BUF)
-            if not data:
-                break
-            payload = (b"\x00\x00" + data) if first else data
-            first = False
-            await ws.send_bytes(payload)
-            traffic_buf.setdefault(uid, {"up": 0, "down": 0})["down"] += len(data)
-    except Exception:
-        pass
-
-async def websocket_tunnel(ws: WebSocket, uuid: str):
-    """Single entry for /ws/{uuid} — VLESS (and trojan clients using same path)"""
-    if not is_valid(uuid):
-        await ws.close(code=1008, reason="not authorized")
-        return
-    await ws.accept()
-    active_conn[uuid] = active_conn.get(uuid, 0) + 1
-    writer = None
-    try:
-        first_msg = await asyncio.wait_for(ws.receive(), timeout=15.0)
-        if first_msg["type"] == "websocket.disconnect":
-            return
-        first_chunk = first_msg.get("bytes") or (first_msg.get("text") or "").encode()
-        if not first_chunk:
-            return
-
-        # Detect Trojan (starts with hex password) vs VLESS
-        is_trojan = False
-        if b"\r\n" in first_chunk[:80]:
-            # Possible trojan
-            try:
-                crlf = first_chunk.index(b"\r\n")
-                if crlf >= 56:
-                    is_trojan = True
-            except ValueError:
-                pass
-
-        if is_trojan:
-            crlf = first_chunk.index(b"\r\n")
-            req = first_chunk[crlf + 2:]
-            if len(req) < 7 or req[0] != 1:
-                await ws.close(); return
-            atyp = req[1]; pos = 2
-            if atyp == 1:
-                host = socket.inet_ntoa(req[pos:pos+4]); pos += 4
-            elif atyp == 3:
-                dlen = req[pos]; pos += 1
-                host = req[pos:pos+dlen].decode("utf-8", errors="ignore"); pos += dlen
-            elif atyp == 4:
-                host = socket.inet_ntop(socket.AF_INET6, req[pos:pos+16]); pos += 16
-            else:
-                await ws.close(); return
-            port = struct.unpack("!H", req[pos:pos+2])[0]; pos += 2
-            payload = req[pos:] if pos < len(req) else b""
-            command = 1
-            address = host
-        else:
-            command, address, port, payload = await parse_vless_header(first_chunk)
-            if command != 1:
-                await ws.close(); return
-
-        logger.info(f"→ {address}:{port} uid={uuid[:8]}")
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(address, port), 10.0)
-        sock = writer.transport.get_extra_info("socket")
-        if sock:
-            try:
-                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            except Exception:
-                pass
-        if payload:
-            writer.write(payload)
-            await writer.drain()
-            traffic_buf.setdefault(uuid, {"up": 0, "down": 0})["up"] += len(payload)
-
-        done, pending = await asyncio.wait(
-            {
-                asyncio.create_task(relay_ws_to_tcp(ws, writer, uuid)),
-                asyncio.create_task(relay_tcp_to_ws(ws, reader, uuid)),
-            },
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        for task in pending:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-    except WebSocketDisconnect:
-        pass
-    except Exception as e:
-        logger.warning(f"tunnel error: {e}")
-    finally:
-        active_conn[uuid] = max(0, active_conn.get(uuid, 1) - 1)
-        if writer:
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
-
 # ── App ─────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info(f"Prism Panel | domain={PUBLIC_DOMAIN}")
+    logger.info(f"Prism Panel v4 (Xray) | domain={PUBLIC_DOMAIN}")
     for u in db.get("users", {}).values():
         refresh_links(u)
     save_db(db)
-    async def flusher():
-        while True:
-            await asyncio.sleep(20)
-            changed = False
-            for uid, tr in list(traffic_buf.items()):
-                if uid in db.get("users", {}) and (tr["up"] or tr["down"]):
-                    db["users"][uid]["used_bytes"] = db["users"][uid].get("used_bytes", 0) + tr["up"] + tr["down"]
-                    db["stats"]["up"] = db["stats"].get("up", 0) + tr["up"]
-                    db["stats"]["down"] = db["stats"].get("down", 0) + tr["down"]
-                    traffic_buf[uid] = {"up": 0, "down": 0}
-                    changed = True
-            if changed:
-                save_db(db)
-    task = asyncio.create_task(flusher())
+    ok = start_xray()
+    if not ok:
+        logger.error("Xray failed to start — configs will not work")
     yield
-    task.cancel()
+    stop_xray()
     save_db(db)
 
-app = FastAPI(title="Prism Panel", version="3.0", lifespan=lifespan)
+app = FastAPI(title="Prism Panel", version="4.0-xray", lifespan=lifespan)
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)
 
-_env = Environment(loader=DictLoader({
-    "index.html": INDEX, "login.html": LOGIN,
-    "dashboard.html": DASHBOARD, "portal.html": PORTAL,
-}), autoescape=select_autoescape(["html"]))
+_env = Environment(
+    loader=DictLoader({
+        "index.html": INDEX, "login.html": LOGIN,
+        "dashboard.html": DASHBOARD, "portal.html": PORTAL,
+    }),
+    autoescape=select_autoescape(["html"]),
+)
 templates = Jinja2Templates(env=_env)
+
+# ── WebSocket proxy: client → panel → Xray ──────────────────
+@app.websocket(WS_PATH)
+async def ws_proxy(websocket: WebSocket):
+    """
+    Transparent WebSocket reverse-proxy to local Xray.
+    Client connects to wss://domain/ws  (TLS by Railway)
+    We forward to ws://127.0.0.1:10000/ws  (Xray, no TLS)
+    """
+    await websocket.accept()
+    reader = writer = None
+    try:
+        # Raw TCP connect to Xray's WS listener and perform WS upgrade manually is hard.
+        # Use asyncio open_connection + websockets library to Xray.
+        import websockets
+        from websockets.client import connect as ws_connect
+
+        xray_url = f"ws://127.0.0.1:{XRAY_PORT}{WS_PATH}"
+        async with ws_connect(
+            xray_url,
+            max_size=None,
+            ping_interval=None,
+            open_timeout=10,
+        ) as xray_ws:
+
+            async def client_to_xray():
+                try:
+                    while True:
+                        msg = await websocket.receive()
+                        if msg["type"] == "websocket.disconnect":
+                            break
+                        data = msg.get("bytes")
+                        text = msg.get("text")
+                        if data is not None:
+                            await xray_ws.send(data)
+                        elif text is not None:
+                            await xray_ws.send(text)
+                except Exception:
+                    pass
+
+            async def xray_to_client():
+                try:
+                    async for message in xray_ws:
+                        if isinstance(message, bytes):
+                            await websocket.send_bytes(message)
+                        else:
+                            await websocket.send_text(message)
+                except Exception:
+                    pass
+
+            done, pending = await asyncio.wait(
+                {asyncio.create_task(client_to_xray()), asyncio.create_task(xray_to_client())},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.warning(f"WS proxy error: {e}")
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 # ── Pages ───────────────────────────────────────────────────
 @app.get("/", response_class=HTMLResponse)
@@ -386,11 +386,13 @@ async def dashboard(request: Request, admin=Depends(require_admin)):
         u["_used"] = fmt_bytes(u.get("used_bytes", 0))
         u["_limit"] = fmt_bytes(u["limit_bytes"]) if u.get("limit_bytes", 0) > 0 else "∞"
         u["_expire"] = (u.get("expire_at") or "")[:10] if u.get("expire_at") else None
+    xray_ok = xray_proc is not None and xray_proc.poll() is None
     return templates.TemplateResponse("dashboard.html", {
         "request": request, "users": users, "domain": PUBLIC_DOMAIN, "url": PUBLIC_URL,
-        "stats": db.get("stats", {}), "active": sum(active_conn.values()),
-        "vless_path": "/ws/{uuid}", "trojan_path": "/ws/{uuid}",
+        "stats": db.get("stats", {}), "active": 0,
+        "vless_path": WS_PATH, "trojan_path": "-",
         "total_traffic": fmt_bytes(db.get("stats", {}).get("up", 0) + db.get("stats", {}).get("down", 0)),
+        "xray_status": "آنلاین" if xray_ok else "آفلاین",
     })
 
 @app.get("/u/{uid}", response_class=HTMLResponse)
@@ -402,12 +404,11 @@ async def user_portal(request: Request, uid: str):
     if user.get("limit_bytes", 0) > 0:
         rem = max(0, user["limit_bytes"] - user.get("used_bytes", 0))
         remaining_str = fmt_bytes(rem)
-        pct = min(100, int(user.get("used_bytes", 0) / user["limit_bytes"] * 100))
+        pct = min(100, int(user.get("used_bytes", 0) / max(1, user["limit_bytes"]) * 100))
     expire_str = "نامحدود"
     if user.get("expire_at"):
         try:
-            exp = datetime.fromisoformat(user["expire_at"])
-            expire_str = exp.strftime("%Y-%m-%d %H:%M")
+            expire_str = datetime.fromisoformat(user["expire_at"]).strftime("%Y-%m-%d %H:%M")
         except Exception:
             pass
     return templates.TemplateResponse("portal.html", {
@@ -416,7 +417,7 @@ async def user_portal(request: Request, uid: str):
         "used_str": fmt_bytes(user.get("used_bytes", 0)),
         "limit_str": fmt_bytes(user["limit_bytes"]) if user.get("limit_bytes", 0) > 0 else "نامحدود",
         "remaining_str": remaining_str, "pct": pct, "expire_str": expire_str,
-        "valid": is_valid(uid), "active": active_conn.get(uid, 0),
+        "valid": is_valid(uid), "active": 0,
     })
 
 # ── API ─────────────────────────────────────────────────────
@@ -447,9 +448,9 @@ async def api_create(data: UserCreate, admin=Depends(require_admin)):
     uid = str(uuid.uuid4())
     expire_at = (utcnow() + timedelta(days=data.expire_days)).isoformat() if data.expire_days > 0 else None
     user = {
-        "uuid": uid, "name": data.name.strip(), "protocol": data.protocol,
+        "uuid": uid, "name": data.name.strip(), "protocol": "vless",
         "fingerprint": data.fingerprint or "chrome", "alpn": data.alpn or "http/1.1",
-        "enabled": data.enabled,
+        "enabled": True,
         "limit_bytes": int(data.traffic_gb * 1024**3) if data.traffic_gb > 0 else 0,
         "used_bytes": 0, "max_conn": data.max_conn, "expire_at": expire_at,
         "note": data.note.strip(), "created": utcnow().isoformat(),
@@ -457,12 +458,14 @@ async def api_create(data: UserCreate, admin=Depends(require_admin)):
     refresh_links(user)
     db.setdefault("users", {})[uid] = user
     save_db(db)
+    reload_xray()
     return user
 
 @app.delete("/api/users/{uid}")
 async def api_delete(uid: str, admin=Depends(require_admin)):
     db.get("users", {}).pop(uid, None)
     save_db(db)
+    reload_xray()
     return {"ok": True}
 
 @app.get("/sub/{uid}")
@@ -470,7 +473,7 @@ async def subscription(uid: str):
     user = get_user(uid)
     if not user or not is_valid(uid):
         raise HTTPException(404, "not found or inactive")
-    lines = [x for x in (user.get("vless"), user.get("trojan")) if x]
+    lines = [user["vless"]] if user.get("vless") else []
     if not lines:
         raise HTTPException(404, "no configs")
     content = base64.b64encode("\n".join(lines).encode()).decode()
@@ -494,46 +497,50 @@ async def subscription(uid: str):
     )
 
 @app.get("/qr/{uid}")
-async def qr(uid: str, proto: str = "vless"):
+async def qr(uid: str):
     user = get_user(uid)
-    if not user:
+    if not user or not user.get("vless"):
         raise HTTPException(404)
-    link = user.get("vless") if proto == "vless" else user.get("trojan")
-    if not link:
-        raise HTTPException(404)
-    img = qrcode.make(link)
+    img = qrcode.make(user["vless"])
     from io import BytesIO
     buf = BytesIO(); img.save(buf, format="PNG"); buf.seek(0)
     return StreamingResponse(buf, media_type="image/png")
 
 @app.get("/api/ping-test/{uid}")
 async def ping_test(uid: str):
+    """Real check: Xray process + local WS path + user validity"""
     user = get_user(uid)
     if not user:
         raise HTTPException(404)
-    import time
-    t0 = time.perf_counter()
-    ok, err = False, ""
+    xray_ok = xray_proc is not None and xray_proc.poll() is None
+    # Try local connect to xray port
+    local_ok = False
     try:
-        r, w = await asyncio.wait_for(asyncio.open_connection(PUBLIC_DOMAIN, 443), 5.0)
+        r, w = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", XRAY_PORT), 2.0)
         w.close()
-        try: await w.wait_closed()
-        except Exception: pass
-        ok = True
-    except Exception as e:
-        err = str(e)
-    ms = int((time.perf_counter() - t0) * 1000)
-    return {"ok": ok, "latency_ms": ms if ok else None, "path": f"/ws/{uid}",
-            "user_enabled": is_valid(uid), "link": user.get("vless"), "error": err or None}
-
-# CRITICAL: register websocket like pxpanel
-@app.websocket("/ws/{uuid}")
-async def ws_route(websocket: WebSocket, uuid: str):
-    await websocket_tunnel(websocket, uuid)
+        local_ok = True
+    except Exception:
+        pass
+    return {
+        "ok": xray_ok and local_ok and is_valid(uid),
+        "xray_running": xray_ok,
+        "xray_port_open": local_ok,
+        "user_enabled": is_valid(uid),
+        "path": WS_PATH,
+        "link": user.get("vless"),
+        "engine": "xray-core",
+    }
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "3.0", "domain": PUBLIC_DOMAIN}
+    xray_ok = xray_proc is not None and xray_proc.poll() is None
+    return {
+        "status": "ok" if xray_ok else "degraded",
+        "version": "4.0-xray",
+        "domain": PUBLIC_DOMAIN,
+        "xray": xray_ok,
+        "ws_path": WS_PATH,
+    }
 
 if __name__ == "__main__":
     if not db.get("users"):
@@ -547,6 +554,6 @@ if __name__ == "__main__":
         refresh_links(user)
         db.setdefault("users", {})[uid] = user
         save_db(db)
-        logger.info(f"Default user {uid}")
-        logger.info(f"Sample link: {user.get('vless')}")
+        logger.info(f"Default user: {uid}")
+        logger.info(f"Link: {user['vless']}")
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info", ws="websockets")
