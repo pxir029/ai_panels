@@ -57,8 +57,8 @@ PUBLIC_URL = (
     else f"http://{PUBLIC_DOMAIN}:{PORT}"
 )
 
-WS_PATH_VLESS = os.getenv("WS_PATH_VLESS", "/prism-vless")
-WS_PATH_TROJAN = os.getenv("WS_PATH_TROJAN", "/prism-trojan")
+WS_PATH_VLESS = os.getenv("WS_PATH_VLESS", "/ws")
+WS_PATH_TROJAN = os.getenv("WS_PATH_TROJAN", "/trojan-ws")
 
 ALGORITHM = "HS256"
 TOKEN_HOURS = 48
@@ -178,13 +178,14 @@ def refresh_links(user: Dict):
     uid = user["uuid"]
     name = user.get("name", "user")
     proto = user.get("protocol", "both")
-    path_v = quote(WS_PATH_VLESS)
-    path_t = quote(WS_PATH_TROJAN)
+    # pxpanel-style paths with UUID in path (best client compatibility)
+    path_v = quote(f"{WS_PATH_VLESS}/{uid}")
+    path_t = quote(f"{WS_PATH_TROJAN}/{uid}")
     if proto in ("vless", "both"):
         user["vless"] = (
             f"vless://{uid}@{PUBLIC_DOMAIN}:443"
             f"?encryption=none&security=tls&type=ws&host={PUBLIC_DOMAIN}"
-            f"&path={path_v}&fp=chrome&sni={PUBLIC_DOMAIN}&alpn=http%2F1.1"
+            f"&path={path_v}&fp=chrome&sni={PUBLIC_DOMAIN}&alpn=http/1.1"
             f"#{quote(name + '-VLESS')}"
         )
     else:
@@ -193,7 +194,7 @@ def refresh_links(user: Dict):
         user["trojan"] = (
             f"trojan://{uid}@{PUBLIC_DOMAIN}:443"
             f"?security=tls&type=ws&host={PUBLIC_DOMAIN}"
-            f"&path={path_t}&fp=chrome&sni={PUBLIC_DOMAIN}&alpn=http%2F1.1"
+            f"&path={path_t}&fp=chrome&sni={PUBLIC_DOMAIN}&alpn=http/1.1"
             f"#{quote(name + '-Trojan')}"
         )
     else:
@@ -221,37 +222,40 @@ async def require_admin(request: Request):
 
 
 # ───────────────────────────── Relay ─────────────────────────────
-async def handle_vless(websocket: WebSocket):
+
+async def handle_vless(websocket: WebSocket, uid: str):
+    """VLESS-WS relay (pxpanel-compatible): path /ws/{uuid}, first downstream frame prefixed with \\x00\\x00"""
+    if not is_valid(uid):
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
-    uid = None
+    active_conn[uid] = active_conn.get(uid, 0) + 1
+    writer = None
     try:
-        first = await websocket.receive_bytes()
-        if len(first) < 18:
-            await websocket.close()
+        msg = await asyncio.wait_for(websocket.receive(), timeout=15.0)
+        if msg["type"] == "websocket.disconnect":
             return
-        try:
-            uid = str(uuid.UUID(bytes=first[1:17]))
-        except Exception:
+        first = msg.get("bytes") or (msg.get("text") or "").encode()
+        if not first or len(first) < 24:
             await websocket.close()
-            return
-        if not is_valid(uid):
-            await websocket.close(code=1008)
             return
 
-        active_conn[uid] = active_conn.get(uid, 0) + 1
-        pos = 17
-        addon = first[pos]
-        pos += 1 + addon
-        if pos >= len(first) or first[pos] != 1:
+        # Parse VLESS header (same layout as pxpanel)
+        pos = 1  # skip version
+        pos += 16  # uuid (already validated via path)
+        addon_len = first[pos]
+        pos += 1 + addon_len
+        command = first[pos]
+        pos += 1
+        if command != 1:  # TCP only
             await websocket.close()
             return
-        pos += 1
-        port = struct.unpack("!H", first[pos:pos + 2])[0]
+        port = int.from_bytes(first[pos:pos + 2], "big")
         pos += 2
         atyp = first[pos]
         pos += 1
         if atyp == 1:
-            host = socket.inet_ntoa(first[pos:pos + 4])
+            host = ".".join(str(b) for b in first[pos:pos + 4])
             pos += 4
         elif atyp == 2:
             dlen = first[pos]
@@ -259,42 +263,36 @@ async def handle_vless(websocket: WebSocket):
             host = first[pos:pos + dlen].decode("utf-8", errors="ignore")
             pos += dlen
         elif atyp == 3:
-            host = socket.inet_ntop(socket.AF_INET6, first[pos:pos + 16])
+            ab = first[pos:pos + 16]
             pos += 16
+            host = socket.inet_ntop(socket.AF_INET6, ab)
         else:
             await websocket.close()
             return
+        payload = first[pos:] if pos < len(first) else b""
 
-        early = first[pos:] if pos < len(first) else b""
-        version = first[0]
-        try:
-            reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), 12)
-        except Exception:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), 12.0)
+        sock = writer.transport.get_extra_info("socket")
+        if sock is not None:
             try:
-                await websocket.send_bytes(bytes([version, 2]))
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             except Exception:
                 pass
-            await websocket.close()
-            return
 
-        # VLESS success response — required for client ping/connect
-        try:
-            await websocket.send_bytes(bytes([version, 0]))
-        except Exception:
-            await websocket.close()
-            return
-
-        if early:
-            writer.write(early)
+        if payload:
+            writer.write(payload)
             await writer.drain()
-            traffic_buf.setdefault(uid, {"up": 0, "down": 0})["up"] += len(early)
+            traffic_buf.setdefault(uid, {"up": 0, "down": 0})["up"] += len(payload)
 
-        async def up():
+        async def ws_to_tcp():
             try:
                 while True:
-                    data = await websocket.receive_bytes()
-                    if not data:
+                    m = await websocket.receive()
+                    if m["type"] == "websocket.disconnect":
                         break
+                    data = m.get("bytes") or b""
+                    if not data:
+                        continue
                     writer.write(data)
                     await writer.drain()
                     traffic_buf.setdefault(uid, {"up": 0, "down": 0})["up"] += len(data)
@@ -306,10 +304,124 @@ async def handle_vless(websocket: WebSocket):
                 except Exception:
                     pass
 
-        async def down():
+        async def tcp_to_ws():
+            first_down = True
             try:
                 while True:
-                    data = await reader.read(65536)
+                    data = await reader.read(256 * 1024)
+                    if not data:
+                        break
+                    # pxpanel: prefix first downstream packet with VLESS response \\x00\\x00
+                    if first_down:
+                        data = b"\x00\x00" + data
+                        first_down = False
+                    await websocket.send_bytes(data)
+                    traffic_buf.setdefault(uid, {"up": 0, "down": 0})["down"] += len(data)
+            except Exception:
+                pass
+
+        done, pending = await asyncio.wait(
+            {asyncio.create_task(ws_to_tcp()), asyncio.create_task(tcp_to_ws())},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.debug(f"VLESS: {e}")
+    finally:
+        active_conn[uid] = max(0, active_conn.get(uid, 1) - 1)
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:
+                pass
+
+
+async def handle_trojan(websocket: WebSocket, uid: str):
+    """Trojan-WS relay with UUID in path"""
+    if not is_valid(uid):
+        await websocket.close(code=1008)
+        return
+    await websocket.accept()
+    active_conn[uid] = active_conn.get(uid, 0) + 1
+    writer = None
+    try:
+        msg = await asyncio.wait_for(websocket.receive(), timeout=15.0)
+        if msg["type"] == "websocket.disconnect":
+            return
+        first = msg.get("bytes") or (msg.get("text") or "").encode()
+        if not first or len(first) < 58:
+            await websocket.close()
+            return
+        try:
+            crlf = first.index(b"\r\n")
+            req = first[crlf + 2:]
+        except ValueError:
+            await websocket.close()
+            return
+        if len(req) < 7 or req[0] != 1:
+            await websocket.close()
+            return
+        atyp = req[1]
+        pos = 2
+        if atyp == 1:
+            host = socket.inet_ntoa(req[pos:pos + 4])
+            pos += 4
+        elif atyp == 3:
+            dlen = req[pos]
+            pos += 1
+            host = req[pos:pos + dlen].decode("utf-8", errors="ignore")
+            pos += dlen
+        elif atyp == 4:
+            host = socket.inet_ntop(socket.AF_INET6, req[pos:pos + 16])
+            pos += 16
+        else:
+            await websocket.close()
+            return
+        port = struct.unpack("!H", req[pos:pos + 2])[0]
+        pos += 2
+        early = req[pos:] if pos < len(req) else b""
+
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), 12.0)
+        sock = writer.transport.get_extra_info("socket")
+        if sock is not None:
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except Exception:
+                pass
+        if early:
+            writer.write(early)
+            await writer.drain()
+
+        async def ws_to_tcp():
+            try:
+                while True:
+                    m = await websocket.receive()
+                    if m["type"] == "websocket.disconnect":
+                        break
+                    data = m.get("bytes") or b""
+                    if data:
+                        writer.write(data)
+                        await writer.drain()
+                        traffic_buf.setdefault(uid, {"up": 0, "down": 0})["up"] += len(data)
+            except Exception:
+                pass
+            finally:
+                try:
+                    writer.close()
+                except Exception:
+                    pass
+
+        async def tcp_to_ws():
+            try:
+                while True:
+                    data = await reader.read(256 * 1024)
                     if not data:
                         break
                     await websocket.send_bytes(data)
@@ -317,14 +429,27 @@ async def handle_vless(websocket: WebSocket):
             except Exception:
                 pass
 
-        await asyncio.gather(up(), down())
+        done, pending = await asyncio.wait(
+            {asyncio.create_task(ws_to_tcp()), asyncio.create_task(tcp_to_ws())},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        logger.debug(f"VLESS: {e}")
+        logger.debug(f"Trojan: {e}")
     finally:
-        if uid:
-            active_conn[uid] = max(0, active_conn.get(uid, 1) - 1)
+        active_conn[uid] = max(0, active_conn.get(uid, 1) - 1)
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:
+                pass
 
 
 async def handle_trojan(websocket: WebSocket):
@@ -715,14 +840,14 @@ async def api_stats(admin=Depends(require_admin)):
     }
 
 
-@app.websocket(WS_PATH_VLESS)
-async def ws_vless(websocket: WebSocket):
-    await handle_vless(websocket)
+@app.websocket(WS_PATH_VLESS + "/{uid}")
+async def ws_vless(websocket: WebSocket, uid: str):
+    await handle_vless(websocket, uid)
 
 
-@app.websocket(WS_PATH_TROJAN)
-async def ws_trojan(websocket: WebSocket):
-    await handle_trojan(websocket)
+@app.websocket(WS_PATH_TROJAN + "/{uid}")
+async def ws_trojan(websocket: WebSocket, uid: str):
+    await handle_trojan(websocket, uid)
 
 
 @app.get("/health")
