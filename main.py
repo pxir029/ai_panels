@@ -47,7 +47,10 @@ XRAY_PORT = int(os.getenv("XRAY_PORT", "10000"))  # internal only
 SECRET_KEY = os.getenv("SECRET_KEY") or secrets.token_hex(32)
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
 PORT = int(os.getenv("PORT", "8080"))
-PUBLIC_DOMAIN = os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("PUBLIC_DOMAIN") or "localhost"
+# A user-provided PUBLIC_DOMAIN always wins — required when the default
+# *.up.railway.app domain is unreachable from the user's region and a
+# custom (e.g. Cloudflare-fronted) domain must be used in the configs.
+PUBLIC_DOMAIN = os.getenv("PUBLIC_DOMAIN") or os.getenv("RAILWAY_PUBLIC_DOMAIN") or "localhost"
 PUBLIC_URL = f"https://{PUBLIC_DOMAIN}" if "localhost" not in PUBLIC_DOMAIN else f"http://{PUBLIC_DOMAIN}:{PORT}"
 WS_PATH = "/ws"
 
