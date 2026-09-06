@@ -86,7 +86,9 @@ def _verify_password(password: str, stored: str) -> bool:
 # ───────────────────────────── Models ─────────────────────────────
 class UserCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=64)
-    protocol: str = Field(default="both", pattern="^(vless|trojan|both)$")
+    protocol: str = Field(default="vless", pattern="^(vless|trojan|both)$")
+    fingerprint: str = Field(default="chrome")
+    alpn: str = Field(default="http/1.1")
     traffic_gb: float = Field(default=0, ge=0)
     expire_days: int = Field(default=0, ge=0)
     max_conn: int = Field(default=0, ge=0)
@@ -177,15 +179,18 @@ def is_valid(uid: str) -> bool:
 def refresh_links(user: Dict):
     uid = user["uuid"]
     name = user.get("name", "user")
-    proto = user.get("protocol", "both")
-    # pxpanel-style paths with UUID in path (best client compatibility)
-    path_v = quote(f"{WS_PATH_VLESS}/{uid}")
-    path_t = quote(f"{WS_PATH_TROJAN}/{uid}")
+    proto = user.get("protocol", "vless")
+    fp = user.get("fingerprint", "chrome") or "chrome"
+    alpn = user.get("alpn", "http/1.1") or "http/1.1"
+    # Important: keep slashes in path (safe="/") — encoded %2F breaks clients
+    path_v = quote(f"{WS_PATH_VLESS}/{uid}", safe="/")
+    path_t = quote(f"{WS_PATH_TROJAN}/{uid}", safe="/")
+    alpn_q = quote(alpn, safe=",")
     if proto in ("vless", "both"):
         user["vless"] = (
             f"vless://{uid}@{PUBLIC_DOMAIN}:443"
             f"?encryption=none&security=tls&type=ws&host={PUBLIC_DOMAIN}"
-            f"&path={path_v}&fp=chrome&sni={PUBLIC_DOMAIN}&alpn=http/1.1"
+            f"&path={path_v}&fp={fp}&sni={PUBLIC_DOMAIN}&alpn={alpn_q}"
             f"#{quote(name + '-VLESS')}"
         )
     else:
@@ -194,7 +199,7 @@ def refresh_links(user: Dict):
         user["trojan"] = (
             f"trojan://{uid}@{PUBLIC_DOMAIN}:443"
             f"?security=tls&type=ws&host={PUBLIC_DOMAIN}"
-            f"&path={path_t}&fp=chrome&sni={PUBLIC_DOMAIN}&alpn=http/1.1"
+            f"&path={path_t}&fp={fp}&sni={PUBLIC_DOMAIN}&alpn={alpn_q}"
             f"#{quote(name + '-Trojan')}"
         )
     else:
@@ -727,6 +732,8 @@ async def api_create(data: UserCreate, admin=Depends(require_admin)):
         "uuid": uid,
         "name": data.name.strip(),
         "protocol": data.protocol,
+        "fingerprint": data.fingerprint or "chrome",
+        "alpn": data.alpn or "http/1.1",
         "enabled": data.enabled,
         "limit_bytes": int(data.traffic_gb * 1024 ** 3) if data.traffic_gb > 0 else 0,
         "used_bytes": 0,
@@ -849,6 +856,41 @@ async def ws_vless(websocket: WebSocket, uid: str):
 async def ws_trojan(websocket: WebSocket, uid: str):
     await handle_trojan(websocket, uid)
 
+
+
+@app.get("/api/ping-test/{uid}")
+async def ping_test(uid: str):
+    """Real connectivity check: verify user exists + measure TCP connect to self domain:443"""
+    user = get_user(uid)
+    if not user:
+        raise HTTPException(404, "user not found")
+    import time
+    host = PUBLIC_DOMAIN
+    port = 443
+    t0 = time.perf_counter()
+    ok = False
+    err = ""
+    try:
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), 5.0)
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        ok = True
+    except Exception as e:
+        err = str(e)
+    ms = int((time.perf_counter() - t0) * 1000)
+    return {
+        "ok": ok,
+        "latency_ms": ms if ok else None,
+        "host": host,
+        "port": port,
+        "path_vless": f"{WS_PATH_VLESS}/{uid}",
+        "user_enabled": is_valid(uid),
+        "error": err or None,
+        "link": user.get("vless") or user.get("trojan"),
+    }
 
 @app.get("/health")
 async def health():
