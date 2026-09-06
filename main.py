@@ -14,7 +14,10 @@ import logging
 import os
 import secrets
 import signal
+import socket
 import subprocess
+import threading
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -145,7 +148,10 @@ def refresh_links(user: Dict) -> Dict:
     uid = user["uuid"]
     name = user.get("name", "user")
     fp = (user.get("fingerprint") or "chrome").strip().lower()
-    alpn = (user.get("alpn") or "http/1.1").strip()
+    alpn = (user.get("alpn") or "http/1.1").strip().lower()
+    # WS transport only works over HTTP/1.1 at the Railway edge — h2 kills the tunnel (no ping).
+    if "h2" in alpn or "http/2" in alpn:
+        alpn = "http/1.1"
     host = PUBLIC_DOMAIN
     label = quote(str(name), safe="")
 
@@ -169,25 +175,21 @@ def refresh_links(user: Dict) -> Dict:
 
 # ── Xray management ─────────────────────────────────────────
 xray_proc: Optional[subprocess.Popen] = None
+_clients_sig: Optional[str] = None
+ws_active: int = 0  # live client tunnels (single event loop — safe plain int)
+
+def _client_signature() -> str:
+    """Signature of the valid-client set — used to skip useless Xray restarts."""
+    return ",".join(sorted(
+        u["uuid"] for u in db.get("users", {}).values()
+        if u.get("enabled", True) and is_valid(u["uuid"])
+    ))
 
 def build_xray_config() -> dict:
     clients = []
     for u in db.get("users", {}).values():
-        if not u.get("enabled", True):
-            continue
-        # still include expired? no - skip invalid
-        if not is_valid(u["uuid"]):
-            # allow enabled but expired skip
-            if u.get("expire_at"):
-                try:
-                    exp = datetime.fromisoformat(u["expire_at"])
-                    if exp.tzinfo is None:
-                        exp = exp.replace(tzinfo=timezone.utc)
-                    if exp < utcnow():
-                        continue
-                except Exception:
-                    pass
-        clients.append({"id": u["uuid"], "email": u.get("name", u["uuid"][:8]), "level": 0})
+        if u.get("enabled", True) and is_valid(u["uuid"]):
+            clients.append({"id": u["uuid"], "email": u.get("name", u["uuid"][:8]), "level": 0})
 
     if not clients:
         # Xray needs at least one client
@@ -195,6 +197,14 @@ def build_xray_config() -> dict:
 
     return {
         "log": {"loglevel": "warning"},
+        # Explicit DNS with IPv4-only queries:
+        # avoids IPv6-blackhole timeouts (a classic "no ping" cause on PaaS)
+        # and works even if the host resolver is broken. "localhost" = system resolver.
+        "dns": {
+            "servers": ["localhost"],
+            "queryStrategy": "UseIPv4",
+            "disableCache": False,
+        },
         "inbounds": [
             {
                 "listen": "127.0.0.1",
@@ -214,13 +224,16 @@ def build_xray_config() -> dict:
                 },
                 "sniffing": {
                     "enabled": True,
-                    "destOverride": ["http", "tls", "quic"],
+                    # no "quic": prevents QUIC-related stalls over WS transport
+                    "destOverride": ["http", "tls"],
+                    "routeOnly": False,
                 },
             }
         ],
         "outbounds": [
-            {"protocol": "freedom", "tag": "direct", "settings": {"domainStrategy": "AsIs"}},
-            {"protocol": "blackhole", "tag": "block"},
+            # UseIPv4: force A records — never hang on unreachable IPv6 routes
+            {"protocol": "freedom", "tag": "direct", "settings": {"domainStrategy": "UseIPv4"}},
+            {"protocol": "blackhole", "tag": "block", "settings": {"response": {"type": "none"}}},
         ],
     }
 
@@ -229,21 +242,61 @@ def write_xray_config():
     XRAY_CONFIG.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     return cfg
 
-def start_xray():
-    global xray_proc
+def _wait_xray_port(timeout_s: float = 3.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if xray_proc is not None and xray_proc.poll() is not None:
+            return False  # died while starting
+        try:
+            with socket.create_connection(("127.0.0.1", XRAY_PORT), timeout=0.25):
+                return True
+        except OSError:
+            time.sleep(0.1)
+    return False
+
+def _drain_xray_output(proc: subprocess.Popen):
+    """Must always drain Xray's stdout — an unread PIPE fills up (64KB) and
+    blocks Xray mid-tunnel, which looks exactly like 'ping suddenly dies'."""
+    try:
+        for raw in iter(proc.stdout.readline, b""):
+            line = raw.decode("utf-8", errors="replace").strip()
+            if line:
+                logger.info(f"[xray] {line}")
+    except Exception:
+        pass
+
+def start_xray() -> bool:
+    global xray_proc, _clients_sig
+    _clients_sig = _client_signature()
     write_xray_config()
     if not Path(XRAY_BIN).exists():
         logger.error(f"Xray binary not found at {XRAY_BIN}")
         return False
-    # stop old
     stop_xray()
+    # validate config BEFORE starting so a bad config never silently kills the tunnel
+    try:
+        chk = subprocess.run(
+            [XRAY_BIN, "run", "-test", "-c", str(XRAY_CONFIG)],
+            capture_output=True, timeout=15,
+        )
+        if chk.returncode != 0:
+            logger.error(f"Xray config invalid: {chk.stderr.decode(errors='replace')[-400:]}")
+            return False
+    except Exception as e:
+        logger.error(f"Xray config test failed: {e}")
+        return False
+
     xray_proc = subprocess.Popen(
         [XRAY_BIN, "run", "-c", str(XRAY_CONFIG)],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
-    logger.info(f"Xray started pid={xray_proc.pid} on 127.0.0.1:{XRAY_PORT} path={WS_PATH}")
-    return True
+    threading.Thread(target=_drain_xray_output, args=(xray_proc,), daemon=True).start()
+    if _wait_xray_port():
+        logger.info(f"Xray started pid={xray_proc.pid} on 127.0.0.1:{XRAY_PORT} path={WS_PATH}")
+        return True
+    logger.error("Xray exited or port never opened — check logs above")
+    return False
 
 def stop_xray():
     global xray_proc
@@ -255,9 +308,40 @@ def stop_xray():
             xray_proc.kill()
     xray_proc = None
 
-def reload_xray():
-    """Regenerate config and restart xray (simple & reliable)."""
-    start_xray()
+def reload_xray(force: bool = False) -> bool:
+    """Restart Xray only when the set of valid clients actually changed.
+    Keeps existing tunnels alive across unrelated DB writes."""
+    global _clients_sig
+    sig = _client_signature()
+    if (
+        not force
+        and sig == _clients_sig
+        and xray_proc is not None
+        and xray_proc.poll() is None
+    ):
+        return True
+    return start_xray()
+
+async def _xray_watchdog():
+    """If Xray dies for ANY reason, bring it back automatically.
+    Without this, one crash = every config stops answering ping until manual restart."""
+    fail_streak = 0
+    while True:
+        try:
+            await asyncio.sleep(8)
+            p = xray_proc
+            if p is None or p.poll() is not None:
+                fail_streak += 1
+                logger.warning(f"Xray watchdog: process down (x{fail_streak}) — restarting")
+                await asyncio.to_thread(start_xray)
+                if xray_proc is not None and xray_proc.poll() is None:
+                    fail_streak = 0
+            else:
+                fail_streak = 0
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Xray watchdog error: {e}")
 
 # ── Auth ────────────────────────────────────────────────────
 def make_token(data: dict) -> str:
@@ -277,8 +361,11 @@ async def require_admin(request: Request):
         raise HTTPException(401, "Invalid session")
 
 # ── App ─────────────────────────────────────────────────────
+_watchdog_task: Optional[asyncio.Task] = None
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _watchdog_task
     logger.info(f"Prism Panel v4 (Xray) | domain={PUBLIC_DOMAIN}")
     for u in db.get("users", {}).values():
         refresh_links(u)
@@ -286,7 +373,10 @@ async def lifespan(app: FastAPI):
     ok = start_xray()
     if not ok:
         logger.error("Xray failed to start — configs will not work")
+    _watchdog_task = asyncio.create_task(_xray_watchdog())
     yield
+    if _watchdog_task:
+        _watchdog_task.cancel()
     stop_xray()
     save_db(db)
 
@@ -303,6 +393,17 @@ _env = Environment(
 templates = Jinja2Templates(env=_env)
 
 # ── WebSocket proxy: client → panel → Xray ──────────────────
+def _ws_connect_factory():
+    """Prefer the modern websockets asyncio API, fall back to the legacy shim."""
+    try:
+        from websockets.asyncio.client import connect  # websockets >= 13
+        return connect
+    except Exception:
+        from websockets.client import connect  # legacy fallback
+        return connect
+
+_ws_connect = _ws_connect_factory()
+
 @app.websocket(WS_PATH)
 async def ws_proxy(websocket: WebSocket):
     """
@@ -310,61 +411,81 @@ async def ws_proxy(websocket: WebSocket):
     Client connects to wss://domain/ws  (TLS by Railway)
     We forward to ws://127.0.0.1:10000/ws  (Xray, no TLS)
     """
+    global ws_active
     await websocket.accept()
-    reader = writer = None
+    ws_active += 1
+    xray_ws = None
+    xray_url = f"ws://127.0.0.1:{XRAY_PORT}{WS_PATH}"
     try:
-        # Raw TCP connect to Xray's WS listener and perform WS upgrade manually is hard.
-        # Use asyncio open_connection + websockets library to Xray.
-        import websockets
-        from websockets.client import connect as ws_connect
-
-        xray_url = f"ws://127.0.0.1:{XRAY_PORT}{WS_PATH}"
-        async with ws_connect(
-            xray_url,
-            max_size=None,
-            ping_interval=None,
-            open_timeout=10,
-        ) as xray_ws:
-
-            async def client_to_xray():
-                try:
-                    while True:
-                        msg = await websocket.receive()
-                        if msg["type"] == "websocket.disconnect":
-                            break
-                        data = msg.get("bytes")
-                        text = msg.get("text")
-                        if data is not None:
-                            await xray_ws.send(data)
-                        elif text is not None:
-                            await xray_ws.send(text)
-                except Exception:
-                    pass
-
-            async def xray_to_client():
-                try:
-                    async for message in xray_ws:
-                        if isinstance(message, bytes):
-                            await websocket.send_bytes(message)
-                        else:
-                            await websocket.send_text(message)
-                except Exception:
-                    pass
-
-            done, pending = await asyncio.wait(
-                {asyncio.create_task(client_to_xray()), asyncio.create_task(xray_to_client())},
-                return_when=asyncio.FIRST_COMPLETED,
+        try:
+            xray_ws = await _ws_connect(
+                xray_url,
+                max_size=None,
+                compression=None,      # v2ray WS frames are already compressed upstream
+                ping_interval=None,    # tunnel traffic keeps it alive; don't inject pings
+                open_timeout=5,
+                close_timeout=2,
             )
-            for t in pending:
-                t.cancel()
-                try:
-                    await t
-                except asyncio.CancelledError:
-                    pass
+        except Exception:
+            # Xray may be mid-reload (user create/delete) — one quick retry
+            await asyncio.sleep(0.3)
+            xray_ws = await _ws_connect(
+                xray_url,
+                max_size=None,
+                compression=None,
+                ping_interval=None,
+                open_timeout=5,
+                close_timeout=2,
+            )
+
+        async def client_to_xray():
+            try:
+                while True:
+                    msg = await websocket.receive()
+                    if msg["type"] == "websocket.disconnect":
+                        break
+                    data = msg.get("bytes")
+                    text = msg.get("text")
+                    if data is not None:
+                        await xray_ws.send(data)
+                    elif text is not None:
+                        await xray_ws.send(text)
+            except Exception:
+                pass
+
+        async def xray_to_client():
+            try:
+                async for message in xray_ws:
+                    if isinstance(message, bytes):
+                        await websocket.send_bytes(message)
+                    else:
+                        await websocket.send_text(message)
+            except Exception:
+                pass
+
+        t1 = asyncio.create_task(client_to_xray())
+        t2 = asyncio.create_task(xray_to_client())
+        done, pending = await asyncio.wait(
+            {t1, t2},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for t in pending:
+            t.cancel()
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
     except WebSocketDisconnect:
         pass
     except Exception as e:
         logger.warning(f"WS proxy error: {e}")
+    finally:
+        ws_active -= 1
+        if xray_ws is not None:
+            try:
+                await xray_ws.close()
+            except Exception:
+                pass
         try:
             await websocket.close()
         except Exception:
@@ -389,7 +510,7 @@ async def dashboard(request: Request, admin=Depends(require_admin)):
     xray_ok = xray_proc is not None and xray_proc.poll() is None
     return templates.TemplateResponse("dashboard.html", {
         "request": request, "users": users, "domain": PUBLIC_DOMAIN, "url": PUBLIC_URL,
-        "stats": db.get("stats", {}), "active": 0,
+        "stats": db.get("stats", {}), "active": ws_active,
         "vless_path": WS_PATH, "trojan_path": "-",
         "total_traffic": fmt_bytes(db.get("stats", {}).get("up", 0) + db.get("stats", {}).get("down", 0)),
         "xray_status": "آنلاین" if xray_ok else "آفلاین",
@@ -417,7 +538,7 @@ async def user_portal(request: Request, uid: str):
         "used_str": fmt_bytes(user.get("used_bytes", 0)),
         "limit_str": fmt_bytes(user["limit_bytes"]) if user.get("limit_bytes", 0) > 0 else "نامحدود",
         "remaining_str": remaining_str, "pct": pct, "expire_str": expire_str,
-        "valid": is_valid(uid), "active": 0,
+        "valid": is_valid(uid), "active": ws_active,
     })
 
 # ── API ─────────────────────────────────────────────────────
@@ -458,14 +579,14 @@ async def api_create(data: UserCreate, admin=Depends(require_admin)):
     refresh_links(user)
     db.setdefault("users", {})[uid] = user
     save_db(db)
-    reload_xray()
+    await asyncio.to_thread(reload_xray)  # non-blocking: never stall live tunnels
     return user
 
 @app.delete("/api/users/{uid}")
 async def api_delete(uid: str, admin=Depends(require_admin)):
     db.get("users", {}).pop(uid, None)
     save_db(db)
-    reload_xray()
+    await asyncio.to_thread(reload_xray)  # non-blocking: never stall live tunnels
     return {"ok": True}
 
 @app.get("/sub/{uid}")
@@ -508,28 +629,105 @@ async def qr(uid: str):
 
 @app.get("/api/ping-test/{uid}")
 async def ping_test(uid: str):
-    """Real check: Xray process + local WS path + user validity"""
+    """REAL tunnel ping: performs the exact handshake a client does
+    (WS → panel /ws → Xray → VLESS → internet) and measures RTT."""
     user = get_user(uid)
     if not user:
         raise HTTPException(404)
     xray_ok = xray_proc is not None and xray_proc.poll() is None
-    # Try local connect to xray port
     local_ok = False
-    try:
-        r, w = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", XRAY_PORT), 2.0)
-        w.close()
-        local_ok = True
-    except Exception:
-        pass
+    if xray_ok:
+        try:
+            r, w = await asyncio.wait_for(asyncio.open_connection("127.0.0.1", XRAY_PORT), 2.0)
+            w.close()
+            local_ok = True
+        except Exception:
+            pass
+    valid = is_valid(uid)
+
+    latency_ms, err = None, None
+    if xray_ok and local_ok and valid:
+        latency_ms, err = await _tunnel_ping(user["uuid"])
+        if latency_ms is None and err is None:
+            err = "timeout"
+    elif not xray_ok or not local_ok:
+        err = "xray engine down"
+    elif not valid:
+        err = "user disabled/expired"
+
+    ok = latency_ms is not None
     return {
-        "ok": xray_ok and local_ok and is_valid(uid),
+        # fields the dashboard's pingTest() reads:
+        "ok": ok,
+        "latency_ms": latency_ms,
+        "error": err,
+        "host": PUBLIC_DOMAIN,
+        "path_vless": WS_PATH,
+        "user_enabled": valid,
+        # legacy fields kept for compatibility:
         "xray_running": xray_ok,
         "xray_port_open": local_ok,
-        "user_enabled": is_valid(uid),
         "path": WS_PATH,
         "link": user.get("vless"),
         "engine": "xray-core",
     }
+
+
+def _vless_probe_request(uid_hex: str, host: str, port: int, first_payload: bytes) -> bytes:
+    """Minimal VLESS v0 request (TCP): ver=0, uuid, addonLen=0, cmd=TCP,
+    port(BE), addrType=domain, addr, payload."""
+    return (
+        b"\x00"
+        + uuid.UUID(uid_hex).bytes
+        + b"\x00"
+        + b"\x01"
+        + int(port).to_bytes(2, "big")
+        + bytes([2, len(host.encode())])
+        + host.encode()
+        + first_payload
+    )
+
+async def _tunnel_ping(probe_uuid: str, timeout: float = 6.0):
+    """Measure real latency through: panel /ws relay → Xray → internet,
+    using the requested user's own UUID (validates that exact config).
+    Tries Google generate_204, falls back to Cloudflare."""
+    targets = [
+        ("www.google.com", 80, b"HEAD /generate_204 HTTP/1.1\r\nHost: www.google.com\r\nUser-Agent: PrismPanel/4\r\nConnection: close\r\n\r\n"),
+        ("cp.cloudflare.com", 80, b"HEAD / HTTP/1.1\r\nHost: cp.cloudflare.com\r\nUser-Agent: PrismPanel/4\r\nConnection: close\r\n\r\n"),
+    ]
+    last_err = None
+    for host, port, req in targets:
+        ws = None
+        try:
+            t0 = time.monotonic()
+            ws = await asyncio.wait_for(
+                _ws_connect(
+                    f"ws://127.0.0.1:{PORT}{WS_PATH}",
+                    max_size=None,
+                    compression=None,
+                    ping_interval=None,
+                    open_timeout=4,
+                    close_timeout=2,
+                ),
+                timeout=timeout,
+            )
+            await ws.send(_vless_probe_request(probe_uuid, host, port, req))
+            first = await asyncio.wait_for(ws.recv(), timeout=timeout)
+            latency = round((time.monotonic() - t0) * 1000)
+            if isinstance(first, bytes) and len(first) >= 2 and first[0] == 0:
+                return latency, None
+            last_err = f"{host}: bad vless response"
+        except asyncio.TimeoutError:
+            last_err = f"{host}: timeout"
+        except Exception as e:
+            last_err = f"{host}: {e or type(e).__name__}"
+        finally:
+            if ws is not None:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+    return None, last_err
 
 @app.get("/health")
 async def health():

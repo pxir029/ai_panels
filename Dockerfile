@@ -6,14 +6,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl unzip ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Install latest Xray-core
-RUN XRAY_VERSION=$(curl -sL https://api.github.com/repos/XTLS/Xray-core/releases/latest | grep -oP '"tag_name": "\K[^"]+' | head -1) \
-    && echo "Xray ${XRAY_VERSION}" \
-    && curl -sL "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip" -o /tmp/xray.zip \
+# Pin a tested Xray-core version (overridable with --build-arg XRAY_VERSION=...).
+# Direct release download + retries: the GitHub API endpoint used before is
+# rate-limited on CI runners and randomly broke builds (=> "no xray => no ping").
+ARG XRAY_VERSION=v25.8.29
+RUN ARCH=$(dpkg --print-architecture) \
+    && case "$ARCH" in \
+         amd64) XARCH="64" ;; \
+         arm64) XARCH="arm64-v8a" ;; \
+         *) XARCH="64" ;; \
+       esac \
+    && echo "Installing Xray-core ${XRAY_VERSION} (linux-${XARCH})" \
+    && for i in 1 2 3 4 5; do \
+         curl -fsSL --retry 3 --retry-delay 2 \
+           "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-${XARCH}.zip" \
+           -o /tmp/xray.zip && break || { echo "download retry $i"; sleep 5; }; \
+       done \
+    && test -s /tmp/xray.zip \
     && unzip -o /tmp/xray.zip -d /usr/local/bin/ \
     && chmod +x /usr/local/bin/xray \
     && rm -f /tmp/xray.zip \
-    && xray version
+    && /usr/local/bin/xray version
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
