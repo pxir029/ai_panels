@@ -107,6 +107,10 @@ class UserUpdate(BaseModel):
 class LoginRequest(BaseModel):
     password: str
 
+class ChangePassword(BaseModel):
+    current: str
+    new_password: str = Field(..., min_length=4, max_length=128)
+
 
 # ───────────────────────────── Storage ─────────────────────────────
 def load_db() -> Dict[str, Any]:
@@ -180,7 +184,7 @@ def refresh_links(user: Dict):
         user["vless"] = (
             f"vless://{uid}@{PUBLIC_DOMAIN}:443"
             f"?encryption=none&security=tls&type=ws&host={PUBLIC_DOMAIN}"
-            f"&path={path_v}&fp=chrome&sni={PUBLIC_DOMAIN}"
+            f"&path={path_v}&fp=chrome&sni={PUBLIC_DOMAIN}&alpn=http%2F1.1"
             f"#{quote(name + '-VLESS')}"
         )
     else:
@@ -189,7 +193,7 @@ def refresh_links(user: Dict):
         user["trojan"] = (
             f"trojan://{uid}@{PUBLIC_DOMAIN}:443"
             f"?security=tls&type=ws&host={PUBLIC_DOMAIN}"
-            f"&path={path_t}&fp=chrome&sni={PUBLIC_DOMAIN}"
+            f"&path={path_t}&fp=chrome&sni={PUBLIC_DOMAIN}&alpn=http%2F1.1"
             f"#{quote(name + '-Trojan')}"
         )
     else:
@@ -262,8 +266,20 @@ async def handle_vless(websocket: WebSocket):
             return
 
         early = first[pos:] if pos < len(first) else b""
+        version = first[0]
         try:
             reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), 12)
+        except Exception:
+            try:
+                await websocket.send_bytes(bytes([version, 2]))
+            except Exception:
+                pass
+            await websocket.close()
+            return
+
+        # VLESS success response — required for client ping/connect
+        try:
+            await websocket.send_bytes(bytes([version, 0]))
         except Exception:
             await websocket.close()
             return
@@ -560,6 +576,16 @@ async def api_logout(request: Request):
     request.session.clear()
     return {"ok": True}
 
+@app.post("/api/change-password")
+async def api_change_password(data: ChangePassword, request: Request, admin=Depends(require_admin)):
+    if not _verify_password(data.current, db.get("admin_hash", "")):
+        if data.current != ADMIN_PASSWORD:
+            raise HTTPException(400, "رمز فعلی اشتباه است")
+    db["admin_hash"] = _hash_password(data.new_password)
+    save_db(db)
+    return {"ok": True, "message": "رمز با موفقیت تغییر کرد"}
+
+
 
 @app.get("/api/users")
 async def api_users(admin=Depends(require_admin)):
@@ -724,6 +750,10 @@ if __name__ == "__main__":
         save_db(db)
         logger.info(f"Default user created: {uid}")
 
+    # refresh all links on startup (domain may change)
+    for _uid, _u in list(db.get("users", {}).items()):
+        refresh_links(_u)
+    save_db(db)
     logger.info(f"Admin password via ADMIN_PASSWORD (default=admin)")
     logger.info(f"Panel → {PUBLIC_URL}/login")
     uvicorn.run(app, host=HOST, port=PORT, log_level="info", ws="websockets")
